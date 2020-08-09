@@ -30,9 +30,19 @@ namespace CRA.ClientLibrary
 
         public ISecureStreamConnectionDescriptor SecureStreamConnectionDescriptor = new DummySecureStreamConnectionDescriptor();
 
-        private Dictionary<string, IVertex> _verticesToSideload = new Dictionary<string, IVertex>();
+        private Dictionary<string, (IVertex, bool, object)> _verticesToSideload = new Dictionary<string, (IVertex, bool, object)>();
         private bool _dynamicLoadingEnabled = true;
         private bool _artifactUploading = true;
+
+        /// <summary>
+        /// TCP connection timeout
+        /// </summary>
+        private int _tcpConnectTimeoutMs = 5000;
+
+        public void SetWorker(CRAWorker worker)
+        {
+            _localWorker = worker;
+        }
 
         public CRAClientLibrary() : this(new AzureDataProvider(), null)
         { }
@@ -62,6 +72,24 @@ namespace CRA.ClientLibrary
             _endpointTableManager = new EndpointTableManager(dataProvider);
             _connectionTableManager = new ConnectionTableManager(dataProvider);
             this.DataProvider = dataProvider;
+        }
+
+        /// <summary>
+        /// Set TCP connection timeout (in milliseconds)
+        /// </summary>
+        /// <param name="tcpConnectTimeoutMs"></param>
+        public void SetTcpConnectionTimeout(int tcpConnectTimeoutMs)
+        {
+            Console.WriteLine("Setting TCP connection timeout (ms) to {0}", tcpConnectTimeoutMs);
+            _tcpConnectTimeoutMs = tcpConnectTimeoutMs;
+        }
+
+        /// <summary>
+        /// Get TCP connection timeout (in milliseconds)
+        /// </summary>
+        internal int GetTcpConnectionTimeout()
+        {
+            return _tcpConnectTimeoutMs;
         }
 
         public IDataProvider DataProvider { get; }
@@ -177,22 +205,36 @@ namespace CRA.ClientLibrary
                 vertexParameter,
                 false);
 
-        internal async Task<CRAErrorCode> InstantiateVertexAsync(
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="instanceName"></param>
+        /// <param name="vertexName"></param>
+        /// <param name="vertexDefinition"></param>
+        /// <param name="vertexParameter"></param>
+        /// <param name="sharded"></param>
+        /// <param name="logicalOnly"></param>
+        /// <param name="sideLoad"></param>
+        /// <returns></returns>
+        public async Task<CRAErrorCode> InstantiateVertexAsync(
             string instanceName,
             string vertexName,
             string vertexDefinition,
             object vertexParameter,
-            bool sharded)
-        { 
-            var procDefRow = await _vertexManager.VertexInfoProvider.GetRowForVertexDefinition(vertexDefinition);
-
+            bool sharded = false, bool logicalOnly = false, bool sideLoad = false, bool activate = false)
+        {
+            string vertexCreateAction = null;
             string blobName = vertexName + "-" + instanceName;
 
-            using (var blobStream = await _blobStorage.GetWriteStream(vertexDefinition + "/" + blobName))
+            if (!sideLoad)
             {
-                byte[] parameterBytes = Encoding.UTF8.GetBytes(
-                            SerializationHelper.SerializeObject(vertexParameter));
-                blobStream.WriteByteArray(parameterBytes);
+                vertexCreateAction = (await _vertexManager.VertexInfoProvider.GetRowForVertexDefinition(vertexDefinition)).Value.VertexCreateAction;
+                using (var blobStream = await _blobStorage.GetWriteStream(vertexDefinition + "/" + blobName))
+                {
+                    byte[] parameterBytes = Encoding.UTF8.GetBytes(
+                                SerializationHelper.SerializeObject(vertexParameter));
+                    blobStream.WriteByteArray(parameterBytes);
+                }
             }
 
             var newInfo = new VertexInfo(
@@ -201,14 +243,17 @@ namespace CRA.ClientLibrary
                 port: 0,
                 vertexName: vertexName,
                 vertexDefinition: vertexDefinition,
-                vertexCreateAction: procDefRow.Value.VertexCreateAction,
+                vertexCreateAction: vertexCreateAction,
                 vertexParameter: blobName,
-                isActive: false,
+                isActive: activate,
                 isSharded:  sharded);
 
             await _vertexManager.VertexInfoProvider.InsertOrReplace(newInfo);
 
             CRAErrorCode result = CRAErrorCode.Success;
+
+            if (logicalOnly)
+                return result;
 
             // Send request to CRA instance
             VertexInfo instanceRow;
@@ -220,8 +265,9 @@ namespace CRA.ClientLibrary
                 Stream stream;
                 if (!TryGetSenderStreamFromPool(instanceRow.Address, instanceRow.Port.ToString(), out stream))
                 {
-                    TcpClient client = new TcpClient(instanceRow.Address, instanceRow.Port);
+                    var client = new TcpClient();
                     client.NoDelay = true;
+                    await client.ConnectAsync(instanceRow.Address, instanceRow.Port, _tcpConnectTimeoutMs);
 
                     stream = client.GetStream();
                     if (SecureStreamConnectionDescriptor != null)
@@ -231,7 +277,6 @@ namespace CRA.ClientLibrary
                 stream.WriteInt32((int)CRATaskMessageType.LOAD_VERTEX);
                 stream.WriteByteArray(Encoding.UTF8.GetBytes(vertexName));
                 stream.WriteByteArray(Encoding.UTF8.GetBytes(vertexDefinition));
-                stream.WriteByteArray(Encoding.UTF8.GetBytes(newInfo.VertexParameter));
 
                 result = (CRAErrorCode)stream.ReadInt32();
                 if (result != 0)
@@ -355,21 +400,28 @@ namespace CRA.ClientLibrary
         /// <param name="vertexParameter"></param>
         /// <param name="instanceName"></param>
         /// <param name="table"></param>
+        /// <param name="performActivation"></param>
         /// <returns></returns>
-        public async Task<IVertex> LoadVertexAsync(string vertexName, string vertexDefinition, string vertexParameter, string instanceName, ConcurrentDictionary<string, IVertex> table)
+        public async Task<IVertex> LoadVertexAsync(string vertexName, string vertexDefinition, string instanceName, ConcurrentDictionary<string, IVertex> table, bool performActivation)
         {
-            // Deactivate vertex
-            await _vertexManager.DeactivateVertexOnInstance(vertexName, instanceName);
-
-            var vertex = await CreateVertexAsync(vertexDefinition);
-            if (vertex == null)
+            if (performActivation)
             {
-                if (_verticesToSideload.ContainsKey(vertexName))
-                {
-                    Debug.WriteLine("Sideloading vertex " + vertexName);
-                    vertex = _verticesToSideload[vertexName];
-                }
-                else
+                // Deactivate vertex
+                await _vertexManager.DeactivateVertexOnInstance(vertexName, instanceName);
+            }
+
+            IVertex vertex;
+            bool paramProvided = false;
+            object param = null;
+            if (_verticesToSideload.ContainsKey(vertexName))
+            {
+                Debug.WriteLine("Sideloading vertex " + vertexName);
+                (vertex, paramProvided, param) = _verticesToSideload[vertexName];
+            }
+            else
+            {
+                vertex = await CreateVertexAsync(vertexDefinition);
+                if (vertex == null)
                 {
                     throw new InvalidOperationException("Failed to create vertex " + vertexName + ", and no sideloaded vertex with that name was provided.");
                 }
@@ -382,7 +434,7 @@ namespace CRA.ClientLibrary
                     vertexDefinition,
                     instanceName,
                     table,
-                    vertex);
+                    vertex, paramProvided, param, performActivation);
             }
             catch (Exception e)
             {
@@ -435,7 +487,7 @@ namespace CRA.ClientLibrary
             string vertexDefinition,
             string instanceName,
             ConcurrentDictionary<string, IVertex> table,
-            IVertex vertex)
+            IVertex vertex, bool paramProvided, object param, bool performActivation = true)
         {
             // INITIALIZE
             if ((VertexBase)vertex != null)
@@ -488,26 +540,41 @@ namespace CRA.ClientLibrary
                 });
             }
 
-
-            string blobName = vertexName + "-" + instanceName;
-            string parameterString;
-
-            using(var parametersStream = await _blobStorage.GetReadStream(vertexDefinition + "/" + blobName))
+            if (!paramProvided)
             {
-                byte[] parametersBytes = parametersStream.ReadByteArray();
-                parameterString = Encoding.UTF8.GetString(parametersBytes);
+                param = await GetParam(vertexDefinition, vertexName, instanceName);
             }
+            await vertex.InitializeAsync(param);
 
-            var par = SerializationHelper.DeserializeObject(parameterString);
-            await vertex.InitializeAsync(par);
-
-            // Activate vertex
-            await ActivateVertexAsync(vertexName, instanceName);
+            if (performActivation)
+            {
+                // Activate vertex
+                await ActivateVertexAsync(vertexName, instanceName);
+            }
         }
 
-        public void SideloadVertex(IVertex vertex, string vertexName)
+        private async Task<object> GetParam(string vertexDefinition, string vertexName, string instanceName)
         {
-            _verticesToSideload[vertexName] = vertex;
+            string blobName = vertexName + "-" + instanceName;
+                string parameterString;
+
+                using (var parametersStream = await _blobStorage.GetReadStream(vertexDefinition + "/" + blobName))
+                {
+                    byte[] parametersBytes = parametersStream.ReadByteArray();
+                    parameterString = Encoding.UTF8.GetString(parametersBytes);
+                }
+
+            return SerializationHelper.DeserializeObject(parameterString);
+        }
+
+        internal void SideloadVertex(IVertex vertex, string vertexName)
+        {
+            _verticesToSideload[vertexName] = (vertex, false, null);
+        }
+
+        internal void SideloadVertex(IVertex vertex, string vertexName, object param)
+        {
+            _verticesToSideload[vertexName] = (vertex, true, param);
         }
 
         public void EnableArtifactUploading()
@@ -526,28 +593,9 @@ namespace CRA.ClientLibrary
         }
 
         /// <summary>
-        /// Load all vertices for the given instance name, returns only when all
-        /// vertices have been initialized and activated.
+        /// Whether dynamic loading is enabled
         /// </summary>
-        /// <param name="thisInstanceName"></param>
-        /// <returns></returns>
-        public async Task<ConcurrentDictionary<string, IVertex>> LoadAllVerticesAsync(string thisInstanceName)
-        {
-            ConcurrentDictionary<string, IVertex> result = new ConcurrentDictionary<string, IVertex>();
-            var rows = await _vertexManager
-                .VertexInfoProvider
-                .GetAllRowsForInstance(thisInstanceName);
-
-            List<Task> t = new List<Task>();
-            foreach (var row in rows)
-            {
-                if (row.VertexName == "") continue;
-                t.Add(LoadVertexAsync(row.VertexName, row.VertexDefinition, row.VertexParameter, thisInstanceName, result));
-            }
-            Task.WaitAll(t.ToArray());
-
-            return result;
-        }
+        public bool DynamicLoadingEnabled => _dynamicLoadingEnabled;
 
         /// <summary>
         /// Add connection info to metadata table
@@ -596,29 +644,39 @@ namespace CRA.ClientLibrary
             string fromEndpoint,
             string toVertexName,
             string toEndpoint,
-            ConnectionInitiator direction)
+            ConnectionInitiator direction, 
+            bool logicalOnly = false, bool nonSharded = false, bool verifyVertices = true)
         {
             // Tell from vertex to establish connection
             // Send request to CRA instance
 
-            // Check that vertex and endpoints are valid and existing
-            if (!await _vertexManager.ExistsVertex(fromVertexName)
-                || !await _vertexManager.ExistsVertex(toVertexName))
+            if (verifyVertices)
             {
-                // Check for sharded vertices
-                List<int> fromVertexShards, toVertexShards;
+                // Check that vertex and endpoints are valid and existing
+                if (!await _vertexManager.ExistsVertex(fromVertexName)
+                    || !await _vertexManager.ExistsVertex(toVertexName))
+                {
+                    if (nonSharded)
+                        return CRAErrorCode.VertexNotFound;
 
-                if ((fromVertexShards = await _vertexManager.ExistsShardedVertex(fromVertexName)).Count == 0)
-                { return CRAErrorCode.VertexNotFound; }
+                    // Check for sharded vertices
+                    List<int> fromVertexShards, toVertexShards;
 
-                if ((toVertexShards = await _vertexManager.ExistsShardedVertex(toVertexName)).Count == 0)
-                { return CRAErrorCode.VertexNotFound; }
+                    if ((fromVertexShards = await _vertexManager.ExistsShardedVertex(fromVertexName)).Count == 0)
+                    { return CRAErrorCode.VertexNotFound; }
 
-                return ConnectSharded(fromVertexName, fromVertexShards, fromEndpoint, toVertexName, toVertexShards, toEndpoint, direction);
+                    if ((toVertexShards = await _vertexManager.ExistsShardedVertex(toVertexName)).Count == 0)
+                    { return CRAErrorCode.VertexNotFound; }
+
+                    return ConnectSharded(fromVertexName, fromVertexShards, fromEndpoint, toVertexName, toVertexShards, toEndpoint, direction);
+                }
             }
 
             // Make the connection information stable
             await _connectionTableManager.AddConnection(fromVertexName, fromEndpoint, toVertexName, toEndpoint);
+
+            if (logicalOnly)
+                return CRAErrorCode.Success;
 
             // We now try best-effort to tell the CRA instance of this connection
             var result = CRAErrorCode.Success;
@@ -666,8 +724,9 @@ namespace CRA.ClientLibrary
                     row.Port.ToString(),
                     out stream))
                 {
-                    client = new TcpClient(row.Address, row.Port);
+                    client = new TcpClient();
                     client.NoDelay = true;
+                    await client.ConnectAsync(row.Address, row.Port, _tcpConnectTimeoutMs);
 
                     stream = client.GetStream();
 

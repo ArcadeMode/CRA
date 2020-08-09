@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -39,6 +40,21 @@ namespace CRA.ClientLibrary
         private readonly ConcurrentDictionary<string, ShardingInfo> shardingInfoTable = new ConcurrentDictionary<string, ShardingInfo>();
 
         /// <summary>
+        /// Delay between connection retries
+        /// </summary>
+        private int _retryDelayMs = 5000;
+
+        /// <summary>
+        /// TCP connection timeout
+        /// </summary>
+        private int _tcpConnectTimeoutMs = 5000;
+
+        /// <summary>
+        /// Enable parallel connection establishment for a given vertex
+        /// </summary>
+        private bool _parallelConnect = false;
+
+        /// <summary>
         /// Define a new worker instance of Common Runtime for Applications (CRA)
         /// </summary>
         /// <param name="workerInstanceName">Name of the worker instance</param>
@@ -53,6 +69,26 @@ namespace CRA.ClientLibrary
             int port,
             IDataProvider azureDataProvider,
             ISecureStreamConnectionDescriptor descriptor = null,
+            int streamsPoolSize = 0) :
+            this(workerInstanceName, address, port, new CRAClientLibrary(azureDataProvider), descriptor, streamsPoolSize)
+        {
+        }
+
+        /// <summary>
+        /// Define a new worker instance of Common Runtime for Applications (CRA)
+        /// </summary>
+        /// <param name="workerInstanceName">Name of the worker instance</param>
+        /// <param name="address">IP address</param>
+        /// <param name="port">Port</param>
+        /// <param name="clientLibrary">CRA client library instance</param>
+        /// <param name="streamsPoolSize">Maximum number of stream connections will be cached in the CRA client</param>
+        /// <param name="descriptor">Secure stream connection callbacks</param>
+        public CRAWorker(
+            string workerInstanceName,
+            string address,
+            int port,
+            CRAClientLibrary clientLibrary,
+            ISecureStreamConnectionDescriptor descriptor = null,
             int streamsPoolSize = 0)
         {
             Console.WriteLine("Starting CRA Worker instance [http://github.com/Microsoft/CRA]");
@@ -65,15 +101,16 @@ namespace CRA.ClientLibrary
             else
             { Console.WriteLine("   Secure network connections: Disabled"); }
 
-            _craClient = new CRAClientLibrary(azureDataProvider, this);
+            _craClient = clientLibrary;
+            _craClient.SetWorker(this);
 
             _workerinstanceName = workerInstanceName;
             _address = address;
             _port = port;
             _streamsPoolSize = streamsPoolSize;
 
-            _vertexInfoProvider = azureDataProvider.GetVertexInfoProvider();
-            _connectionInfoProvider = azureDataProvider.GetVertexConnectionInfoProvider();
+            _vertexInfoProvider = _craClient.DataProvider.GetVertexInfoProvider();
+            _connectionInfoProvider = _craClient.DataProvider.GetVertexConnectionInfoProvider();
 
             if (descriptor != null)
             { _craClient.SecureStreamConnectionDescriptor = descriptor; }
@@ -93,6 +130,36 @@ namespace CRA.ClientLibrary
         {
             Console.WriteLine("Disabling dynamic assembly loading");
             _craClient.DisableDynamicLoading();
+        }
+
+        /// <summary>
+        /// Set connection retry delay (in milliseconds)
+        /// </summary>
+        /// <param name="retryDelayMs"></param>
+        public void SetConnectionRetryDelay(int retryDelayMs)
+        {
+            Console.WriteLine("Setting connection retry delay (ms) to {0}", retryDelayMs);
+            _retryDelayMs = retryDelayMs;
+        }
+
+        /// <summary>
+        /// Set TCP connection timeout (in milliseconds)
+        /// </summary>
+        /// <param name="tcpConnectTimeoutMs"></param>
+        public void SetTcpConnectionTimeout(int tcpConnectTimeoutMs)
+        {
+            Console.WriteLine("Setting TCP connection timeout (ms) to {0}", tcpConnectTimeoutMs);
+            _tcpConnectTimeoutMs = tcpConnectTimeoutMs;
+        }
+
+
+        /// <summary>
+        /// Enable parallel connection establishment from given vertex
+        /// </summary>
+        public void EnableParallelConnections()
+        {
+            Console.WriteLine("Enabling parallel connection establishment");
+            _parallelConnect = true;
         }
 
         public void Dispose()
@@ -125,6 +192,57 @@ namespace CRA.ClientLibrary
             _craClient.SideloadVertex(vertex, vertexName);
         }
 
+        public async Task InstantSideloadVertexAsync(IVertex vertex, string vertexDefinition, string vertexName, bool loadParamFromMetadata = true, object param = null, bool loadConnectionsFromMetadata = true, IEnumerable<VertexConnectionInfo> outRows = null, IEnumerable<VertexConnectionInfo> inRows = null, bool waitForMetadata = false)
+        {
+            Console.WriteLine("Enabling sideload for vertex: " + vertexName + " (" + vertex.GetType().FullName + ")");
+            
+            if (loadParamFromMetadata)
+                _craClient.SideloadVertex(vertex, vertexName);
+            else
+                _craClient.SideloadVertex(vertex, vertexName, param);
+
+            if (!_localVertexTable.ContainsKey(vertexName))
+            {
+                await _craClient.LoadVertexAsync(vertexName, vertexDefinition, _workerinstanceName, _localVertexTable, false);
+
+                if (loadConnectionsFromMetadata)
+                {
+                    if (outRows != null || inRows != null)
+                    {
+                        throw new Exception("Do not provide connection info if loadConnectionsFromMetadata is set");
+                    }
+                    outRows = await _connectionInfoProvider.GetAllConnectionsFromVertex(vertexName);
+                    inRows = await _connectionInfoProvider.GetAllConnectionsToVertex(vertexName);
+                }
+                // Do not await this: happens in background
+                var _ = RestoreConnections(outRows, inRows);
+            }
+            // Update metadata table with sideload information
+            _craClient.DisableArtifactUploading();
+            var taskList = new List<Task>();
+
+            taskList.Add(_craClient.DefineVertexAsync(vertexDefinition, null));
+            taskList.Add(_craClient.InstantiateVertexAsync(_workerinstanceName, vertexName, vertexDefinition, param, false, true, true, true));
+
+            if (!loadConnectionsFromMetadata)
+            {
+                if (outRows != null)
+                    foreach (var row in outRows)
+                    {
+                        taskList.Add(_craClient.ConnectAsync(row.FromVertex, row.FromEndpoint, row.ToVertex, row.ToEndpoint, ConnectionInitiator.FromSide, true, true, false));
+                    }
+
+                if (inRows != null)
+                    foreach (var row in inRows)
+                    {
+                        taskList.Add(_craClient.ConnectAsync(row.FromVertex, row.FromEndpoint, row.ToVertex, row.ToEndpoint, ConnectionInitiator.FromSide, true, true, false));
+                    }
+            }
+
+            if (waitForMetadata)
+                await Task.WhenAll(taskList);
+        }
+
         /// <summary>
         /// Start the CRA worker. This method does not return.
         /// </summary>
@@ -135,12 +253,26 @@ namespace CRA.ClientLibrary
 
             // Then start server. This ensures that others can establish 
             // connections to local vertices at this point.
-            Thread serverThread = new Thread(()=> StartServer().Wait());
+            Thread serverThread = new Thread(() => StartServerAsync().Wait());
             serverThread.IsBackground = true;
             serverThread.Start();
 
             // Wait for server to complete execution
             serverThread.Join();
+        }
+
+        /// <summary>
+        /// Start the CRA worker
+        /// </summary>
+        public async Task StartAsync()
+        {
+            Console.WriteLine($"Registering CRA instance {_workerinstanceName}");
+            // Update vertex table
+            _craClient.RegisterInstance(_workerinstanceName, _address, _port);
+            Console.WriteLine("Finished registering CRA instance");
+            // Then start server. This ensures that others can establish 
+            // connections to local vertices at this point.
+            await StartServerAsync();
         }
 
         internal async Task<CRAErrorCode> Connect_InitiatorSide(
@@ -205,16 +337,18 @@ namespace CRA.ClientLibrary
 
             // Send request to CRA instance
             Stream ns = null;
-            var _row = (await _vertexInfoProvider.GetRowForInstanceVertex(row.InstanceName, ""))
-                .Value;
+            VertexInfo _row = default;
 
             try
             {
+                _row = (await _vertexInfoProvider.GetRowForInstanceVertex(row.InstanceName, "")).Value;
+
                 // Get a stream connection from the pool if available
                 if (!_craClient.TryGetSenderStreamFromPool(_row.Address, _row.Port.ToString(), out ns))
                 {
-                    TcpClient client = new TcpClient(_row.Address, _row.Port);
+                    var client = new TcpClient();
                     client.NoDelay = true;
+                    await client.ConnectAsync(_row.Address, _row.Port, _tcpConnectTimeoutMs);
 
                     ns = _craClient.SecureStreamConnectionDescriptor
                           .CreateSecureClient(client.GetStream(), row.InstanceName);
@@ -655,7 +789,7 @@ namespace CRA.ClientLibrary
 
                     if (fromVertex != null && toVertex != null && fromVertex.CanFuseWith(toVertex, toVertexName, toVertexInput))
                     {
-                        await fromVertex.ToInputAsync(toVertex, fromVertexName, fromVertexOutput, source.Token);
+                        await fromVertex.ToInputAsync(toVertex, toVertexName, toVertexInput, source.Token);
                     }
                     else
                     {
@@ -713,7 +847,7 @@ namespace CRA.ClientLibrary
             switch (message)
             {
                 case CRATaskMessageType.LOAD_VERTEX:
-                    Task.Run(() => LoadVertex(stream));
+                    Task.Run(() => LoadVertexAsync(stream));
                     break;
 
                 case CRATaskMessageType.CONNECT_VERTEX_INITIATOR:
@@ -854,70 +988,111 @@ namespace CRA.ClientLibrary
             }
         }
 
-        private void LoadVertex(object streamObject)
+        private async Task LoadVertexAsync(object streamObject)
         {
             var stream = (Stream)streamObject;
 
             string vertexName = Encoding.UTF8.GetString(stream.ReadByteArray());
             string vertexDefinition = Encoding.UTF8.GetString(stream.ReadByteArray());
-            string vertexParam = Encoding.UTF8.GetString(stream.ReadByteArray());
 
-            _craClient
-                .LoadVertexAsync(vertexName, vertexDefinition, vertexParam, _workerinstanceName, _localVertexTable)
-                .Wait();
+            await _craClient
+                .LoadVertexAsync(vertexName, vertexDefinition, _workerinstanceName, _localVertexTable, true);
 
             stream.WriteInt32(0);
 
             Task.Run(() => TryReuseReceiverStream(stream));
         }
 
+        private async Task RestoreConnections(IEnumerable<VertexConnectionInfo> outRows, IEnumerable<VertexConnectionInfo> inRows)
+        {            
+            var outQueue = new Queue<VertexConnectionInfo>();
+
+            if (outRows != null)
+                foreach (var row in outRows)
+                    outQueue.Enqueue(row);
+
+            var inQueue = new Queue<VertexConnectionInfo>();
+
+            if (inRows != null)
+                foreach (var row in inRows)
+                    inQueue.Enqueue(row);
+
+            while (outQueue.Count > 0 || inQueue.Count > 0)
+            {
+                if (outQueue.Count > 0)
+                {
+                    var row = outQueue.Dequeue();
+                    var task = RetryRestoreConnection(row.FromVertex, row.FromEndpoint, row.ToVertex, row.ToEndpoint, false, _parallelConnect);
+                    if (!_parallelConnect)
+                    {
+                        bool done = await task;
+                        if (!done)
+                        {
+                            outQueue.Enqueue(row);
+                        }
+                    }
+                }
+
+                if (inQueue.Count > 0)
+                {
+                    var row = inQueue.Dequeue();
+                    var task = RetryRestoreConnection(row.FromVertex, row.FromEndpoint, row.ToVertex, row.ToEndpoint, true, _parallelConnect);
+                    if (!_parallelConnect)
+                    {
+                        bool done = await task;
+                        if (!done)
+                        {
+                            inQueue.Enqueue(row);
+                        }
+                    }
+                }
+            }
+        }
+
         private async Task RestoreConnections(VertexInfo _row)
         {
-            // Decide what to do if connection creation fails
             var outRows = await _connectionInfoProvider.GetAllConnectionsFromVertex(_row.VertexName);
-
-            foreach (var row in outRows)
-            {
-                await RetryRestoreConnection(row.FromVertex, row.FromEndpoint, row.ToVertex, row.ToEndpoint, false);
-            }
-
             var inRows = await _connectionInfoProvider.GetAllConnectionsToVertex(_row.VertexName);
-            foreach (var row in inRows)
+            await RestoreConnections(outRows, inRows);
+        }
+
+        internal async Task RestoreVertexAndConnectionsAsync(VertexInfo _row)
+        {
+            if (!_localVertexTable.ContainsKey(_row.VertexName))
             {
-                await RetryRestoreConnection(row.FromVertex, row.FromEndpoint, row.ToVertex, row.ToEndpoint, true);
+                await _craClient.LoadVertexAsync(_row.VertexName, _row.VertexDefinition, _workerinstanceName, _localVertexTable, true);
+                await RestoreConnections(_row);
             }
         }
 
-        private async void RestoreVertexAndConnections(VertexInfo _row)
-        {
-            await _craClient.LoadVertexAsync(_row.VertexName, _row.VertexDefinition, _row.VertexParameter, _workerinstanceName, _localVertexTable);
-            await RestoreConnections(_row);
-        }
-
-        private async Task RestoreVerticesAndConnections()
+        private async Task RestoreVerticesAndConnectionsAsync()
         {
             var rows = await _vertexInfoProvider.GetAllRowsForInstance(_workerinstanceName);
 
             foreach (var _row in rows)
             {
                 if (string.IsNullOrEmpty(_row.VertexName)) continue;
-                RestoreVertexAndConnections(_row);
+                // Restore vertices in parallel tasks
+                var _ = RestoreVertexAndConnectionsAsync(_row);
             }
         }
 
-        private async Task RetryRestoreConnection(
+        private async Task<bool> RetryRestoreConnection(
             string fromVertexName,
             string fromVertexOutput,
             string toVertexName,
             string toVertexInput,
-            bool reverse)
+            bool reverse,
+            bool retryForever = true)
         {
             var conn = reverse ? inConnections : outConnections;
 
             bool killRemote = false;
+            bool first = true;
+
             while (!conn.ContainsKey(fromVertexName + ":" + fromVertexOutput + ":" + toVertexName + ":" + toVertexInput))
             {
-                if (!await _connectionInfoProvider.ContainsRow(
+                if (!first && !await _connectionInfoProvider.ContainsRow(
                     new VertexConnectionInfo(
                         fromVertex: fromVertexName,
                         fromEndpoint: fromVertexOutput,
@@ -926,7 +1101,7 @@ namespace CRA.ClientLibrary
                 {
                     break;
                 }
-
+                first = false;
 
                 Debug.WriteLine("Connecting " + fromVertexName + ":" + fromVertexOutput + ":" + toVertexName + ":" + toVertexInput);
                 Debug.WriteLine("Connecting with killRemote set to " + (killRemote ? "true" : "false"));
@@ -944,19 +1119,29 @@ namespace CRA.ClientLibrary
                 if (result != 0)
                 {
                     if (result == CRAErrorCode.ServerRecovering)
-                    { killRemote = true; }
-
-                    await Task.Delay(5000);
+                    {
+                        if (killRemote && !retryForever)
+                            return false;
+                        killRemote = true;
+                        await Task.Delay(_retryDelayMs);
+                    }
+                    else
+                    {
+                        await Task.Delay(_retryDelayMs);
+                        if (!retryForever)
+                            return false;
+                    }
                 }
                 else
                     break;
             }
+            return true;
         }
 
-        private async Task StartServer()
+        private async Task StartServerAsync()
         {
             // Restore vertices on machine
-            await RestoreVerticesAndConnections();
+            await RestoreVerticesAndConnectionsAsync();
 
             var server = new TcpListener(IPAddress.Parse(_address), _port);
 
@@ -966,7 +1151,7 @@ namespace CRA.ClientLibrary
             while (true)
             {
                 Debug.WriteLine("Waiting for a connection... ");
-                TcpClient client = server.AcceptTcpClient();
+                TcpClient client = await server.AcceptTcpClientAsync();
                 client.NoDelay = true;
 
                 Debug.WriteLine("Connected!");
